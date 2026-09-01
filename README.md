@@ -1,4 +1,4 @@
-# 🏓 tping
+# 🏓 TPing
 
 **Ping for Telegram Proxies** - Test connectivity to Telegram Proxies, just like `ping` for IP addresses.
 

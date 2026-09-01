@@ -1,0 +1,57 @@
+{
+  "name": "@erfan_bahramali/tping",
+  "version": "1.0.0",
+  "description": "Ping for Telegram Proxies - Test connectivity to Telegram Proxies (MTProto, SOCKS5)",
+  "keywords": [
+    "telegram",
+    "mtproto",
+    "proxy",
+    "checker",
+    "cli",
+    "validator",
+    "ping",
+    "connection-test",
+    "network-tool"
+  ],
+  "author": "Erfan Bahramali",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ErfanBahramali/tping.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ErfanBahramali/tping/issues"
+  },
+  "homepage": "https://github.com/ErfanBahramali/tping#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "tping": "dist/index.js"
+  },
+  "scripts": {
+    "dev": "bun src/index.ts",
+    "clean": "bun run rm -rf dist",
+    "prebuild": "bun run clean",
+    "build": "bun tsc",
+    "prepublishOnly": "bun run build"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "cli-table3": "^0.6.5",
+    "commander": "^14.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "bun-types": "^1.4.0",
+    "typescript": "^5.9.3"
+  }
+}

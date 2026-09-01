@@ -1,0 +1,11 @@
+# Sample Telegram Proxies for Testing
+# Only official Telegram proxy URL formats are supported
+
+# MTProto proxies (Telegram URL format)
+# https://t.me/proxy?server=proxy.example.com&port=443&secret=0123456789abcdef0123456789abcdef
+# tg://proxy?server=proxy.example.com&port=443&secret=0123456789abcdef
+
+# SOCKS5 proxies (Telegram URL format)
+# https://t.me/socks?server=proxy.example.com&port=1080
+# https://t.me/socks?server=proxy.example.com&port=1080&user=admin&pass=secret
+# tg://socks?server=proxy.example.com&port=1080&user=admin&pass=secret

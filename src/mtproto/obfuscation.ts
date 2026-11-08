@@ -1,105 +1,90 @@
 import { randomBytes, createHash } from 'crypto';
 import { AESCTR } from '../crypto/aes-ctr.js';
+import type { Pipe } from '../net/stream.js';
+import { PROTOCOL_TAGS, type TransportMode } from './transport.js';
 
 /**
- * Protocol tags for MTProto transports.
+ * First-int values the 64-byte init header must not start with: they would make
+ * the connection look like HTTP (HEAD/POST/GET /OPTIONS), TLS, or a plain transport tag.
  */
-export const PROTO_TAG = {
-  ABRIDGED: Buffer.from([0xef, 0xef, 0xef, 0xef]),
-  INTERMEDIATE: Buffer.from([0xee, 0xee, 0xee, 0xee]),
-  SECURE: Buffer.from([0xdd, 0xdd, 0xdd, 0xdd]),
+const FORBIDDEN_FIRST_INTS: readonly number[] = [
+  0x44414548, // HEAD
+  0x54534f50, // POST
+  0x20544547, // GET
+  0x4954504f, // OPTI
+  0x02010316, // TLS handshake
+  0xdddddddd,
+  0xeeeeeeee,
+];
+
+export interface Obfuscation {
+  readonly header: Buffer;
+  readonly encryptor: AESCTR;
+  readonly decryptor: AESCTR;
+}
+
+const generateRandomHeader = (): Buffer => {
+  for (;;) {
+    const random = randomBytes(64);
+    if (random[0] === 0xef) continue;
+    if (FORBIDDEN_FIRST_INTS.includes(random.readUInt32LE(0))) continue;
+    if (random.readUInt32LE(4) === 0) continue;
+    return random;
+  }
+};
+
+const deriveKey = (material: Buffer, secret?: Buffer): Buffer =>
+  secret ? createHash('sha256').update(material).update(secret).digest() : Buffer.from(material);
+
+/**
+ * Build the obfuscated2 init header (MTProto transport obfuscation).
+ *
+ * @param dcId - DC id written at offset 60 (signed 16-bit LE); negative for media DCs
+ * @param mode - transport framing, selects the protocol tag at offset 56
+ * @param secret - 16-byte proxy key; omitted for direct connections to a DC
+ */
+export const createObfuscation = (dcId: number, mode: TransportMode, secret?: Buffer): Obfuscation => {
+  if (secret && secret.length !== 16) {
+    throw new Error('Proxy secret key must be 16 bytes');
+  }
+
+  const header = generateRandomHeader();
+  const reversed = Buffer.from(header.subarray(8, 56)).reverse();
+
+  const encryptor = new AESCTR(deriveKey(header.subarray(8, 40), secret), Buffer.from(header.subarray(40, 56)));
+  const decryptor = new AESCTR(deriveKey(reversed.subarray(0, 32), secret), Buffer.from(reversed.subarray(32, 48)));
+
+  header.writeUInt32LE(PROTOCOL_TAGS[mode], 56);
+  header.writeInt16LE(dcId, 60);
+
+  // Encrypt the full header to advance the keystream by 64 bytes, but only
+  // the tail (protocol tag, DC id, 2 random bytes) goes out encrypted.
+  const encrypted = encryptor.encrypt(header);
+  encrypted.copy(header, 56, 56);
+
+  return { header, encryptor, decryptor };
 };
 
 /**
- * Reserved byte sequences that must be avoided in random nonce.
+ * Pipe that prepends the init header to the first write and AES-CTR
+ * encrypts/decrypts everything else.
  */
-const RESERVED_KEYWORDS = [
-  Buffer.from([0x50, 0x56, 0x72, 0x47]), // PVrG
-  Buffer.from([0x47, 0x45, 0x54, 0x20]), // GET
-  Buffer.from([0x50, 0x4f, 0x53, 0x54]), // POST
-  Buffer.from([0xee, 0xee, 0xee, 0xee]), // eeee
-];
+export class ObfuscatedPipe implements Pipe {
+  private headerSent = false;
 
-interface ObfuscationKeys {
-  header: Buffer;
-  encryptor: AESCTR;
-  decryptor: AESCTR;
-}
+  constructor(private readonly inner: Pipe, private readonly obfuscation: Obfuscation) {}
 
-/**
- * Initialize MTProto obfuscation layer.
- * Generates random 64-byte header and derives encryption keys.
- *
- * @param secret - 16-byte secret from proxy
- * @param dcId - Telegram datacenter ID
- * @param protocolTag - Transport protocol tag (default: INTERMEDIATE)
- * @returns Header buffer and encryptor/decryptor ciphers
- */
-export function initObfuscation(
-  secret: Buffer,
-  dcId: number,
-  protocolTag: Buffer = PROTO_TAG.INTERMEDIATE
-): ObfuscationKeys {
-  if (secret.length !== 16) {
-    throw new Error('Secret must be 16 bytes');
+  write(data: Buffer): void {
+    const encrypted = this.obfuscation.encryptor.encrypt(data);
+    if (this.headerSent) {
+      this.inner.write(encrypted);
+      return;
+    }
+    this.headerSent = true;
+    this.inner.write(Buffer.concat([this.obfuscation.header, encrypted]));
   }
 
-  // Generate 64 random bytes, avoiding reserved patterns
-  let random: Buffer;
-  while (true) {
-    random = randomBytes(64);
-
-    // Check if first byte is not 0xef
-    if (random[0] === 0xef) continue;
-
-    // Check if bytes 4-8 are not all zeros
-    if (random.slice(4, 8).equals(Buffer.alloc(4))) continue;
-
-    // Check if first 4 bytes don't match reserved keywords
-    const isReserved = RESERVED_KEYWORDS.some((keyword) =>
-      keyword.equals(random.slice(0, 4))
-    );
-    if (isReserved) continue;
-
-    break;
+  async read(length: number): Promise<Buffer> {
+    return this.obfuscation.decryptor.encrypt(await this.inner.read(length));
   }
-
-  // Convert to mutable buffer
-  const header = Buffer.from(random);
-
-  // Reverse bytes 8-56 for decryption key derivation
-  const reversed = Buffer.from(header.slice(8, 56)).reverse();
-
-  // Derive encryption key and IV
-  const encryptKey = createHash('sha256')
-    .update(Buffer.concat([header.slice(8, 40), secret]))
-    .digest(); // 32 bytes
-
-  const encryptIv = header.slice(40, 56); // 16 bytes
-
-  // Derive decryption key and IV
-  const decryptKey = createHash('sha256')
-    .update(Buffer.concat([reversed.slice(0, 32), secret]))
-    .digest();
-
-  const decryptIv = reversed.slice(32, 48);
-
-  // Create AES-256-CTR ciphers
-  const encryptor = new AESCTR(encryptKey, encryptIv);
-  const decryptor = new AESCTR(decryptKey, decryptIv);
-
-  // Encode protocol tag and DC ID at positions 56-62
-  protocolTag.copy(header, 56);
-
-  // DC ID as signed 16-bit little-endian
-  header.writeInt16LE(dcId, 60);
-
-  // Encrypt the tail (tag + dc ID) in place. The cipher stream position must
-  // be 56 here: the proxy decrypts the whole 64-byte frame from position 0 and
-  // expects the tag to appear at bytes 56-60. Encrypting the whole header and
-  // taking the tail (as official clients do) yields exactly that.
-  const encryptedTail = encryptor.encrypt(header).subarray(56);
-  encryptedTail.copy(header, 56);
-
-  return { header, encryptor, decryptor };
 }

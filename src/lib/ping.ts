@@ -1,83 +1,82 @@
 import type { TelegramProxy, CheckResult } from '../types/index.js';
 import { checkProxy } from './checker.js';
-import { printPingResult, printPingStatistics } from '../utils/format.js';
+import { formatPingLine, printPingStatistics } from '../utils/format.js';
+
+export interface PingOptions {
+  readonly count?: number;
+  readonly interval: number;
+  readonly timeout: number;
+  readonly dcs: readonly number[];
+  readonly ipv6: boolean;
+  readonly verbose: boolean;
+}
+
+const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
+  new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const done = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+  });
 
 /**
- * Ping proxies continuously.
+ * Ping all proxies in rounds, like `ping`. Returns every non-aborted result per proxy.
+ *
+ * On a TTY with enough rows the lines of a round are updated in place;
+ * otherwise (pipes, files, many proxies) each result is printed when it arrives.
  */
-export const pingProxy = async (
-    proxies: readonly TelegramProxy[],
-    options: {
-        count?: number;
-        interval?: number;
-        timeout?: number;
-    },
-    signal?: AbortSignal
+export const pingProxies = async (
+  proxies: readonly TelegramProxy[],
+  options: PingOptions,
+  signal: AbortSignal
 ): Promise<readonly CheckResult[][]> => {
-    const { count, interval = 1000, timeout = 10000 } = options;
-    let shouldStop = false;
+  const out = process.stdout;
+  const live = Boolean(out.isTTY) && proxies.length < (out.rows ?? 24) - 2;
+  const allResults: CheckResult[][] = proxies.map(() => []);
 
-    // Handle abort signal
-    if (signal) {
-        signal.addEventListener('abort', () => {
-            shouldStop = true;
+  for (let sequence = 1; options.count === undefined || sequence <= options.count; sequence++) {
+    if (signal.aborted) {
+      break;
+    }
+
+    if (live) {
+      proxies.forEach((_, i) => out.write(`${formatPingLine(i, proxies, sequence, undefined, options.verbose)}\n`));
+    }
+
+    await Promise.all(
+      proxies.map(async (proxy, i) => {
+        const result = await checkProxy(proxy, {
+          timeout: options.timeout,
+          dcs: options.dcs,
+          ipv6: options.ipv6,
+          signal,
         });
+        if (!result.aborted) {
+          allResults[i].push(result);
+        }
+
+        const line = formatPingLine(i, proxies, sequence, result, options.verbose);
+        if (live) {
+          const up = proxies.length - i;
+          out.write(`\x1b[${up}A\r\x1b[2K${line}\x1b[${up}B\r`);
+        } else if (!result.aborted) {
+          out.write(`${line}\n`);
+        }
+      })
+    );
+
+    if (options.count === undefined || sequence < options.count) {
+      await sleep(options.interval, signal);
     }
+  }
 
-    const sleep = (ms: number): Promise<void> => {
-        return new Promise((resolve) => setTimeout(resolve, ms));
-    };
-
-    // Initialize results array for each proxy
-    const allResults: CheckResult[][] = proxies.map(() => []);
-    let sequence = 1;
-
-    // Main ping loop - all proxies tested together
-    while (!shouldStop) {
-        // Check if we've reached the count limit
-        if (count !== undefined && sequence > count) {
-            break;
-        }
-
-        // Show testing status for all proxies
-        for (let i = 0; i < proxies.length; i++) {
-            printPingResult(i, proxies, sequence, 'testing');
-            process.stdout.write('\n');
-        }
-
-        // Ping all proxies in parallel with real-time updates
-        await Promise.all(
-            proxies.map(async (proxy, i) => {
-                const result = await checkProxy(proxy, timeout);
-                allResults[i].push(result);
-
-                // Move cursor to the correct line and update
-                const lineOffset = proxies.length - i;
-                process.stdout.write(`\x1b[${lineOffset}A`); // Move up
-                printPingResult(i, proxies, sequence, 'done', result);
-                process.stdout.write(`\x1b[${lineOffset}B`); // Move back down
-            })
-        );
-
-        // Move to position after all lines
-        process.stdout.write('\n');
-
-        sequence++;
-
-        // Check if aborted or should stop
-        if (shouldStop) {
-            break;
-        }
-
-        // Wait for interval before next ping (unless it's the last one)
-        if (count === undefined || sequence <= count) {
-            if (!shouldStop) {
-                await sleep(interval);
-            }
-        }
-    }
-
-    printPingStatistics(proxies, allResults);
-
-    return allResults;
+  printPingStatistics(proxies, allResults);
+  return allResults;
 };

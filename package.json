@@ -1,17 +1,20 @@
 {
   "name": "@erfan_bahramali/tping",
-  "version": "1.0.0",
-  "description": "Ping for Telegram Proxies - Test connectivity to Telegram Proxies (MTProto, SOCKS5)",
+  "version": "1.1.0",
+  "description": "Ping for Telegram Proxies - real MTProto handshake through MTProto (simple, dd, Fake TLS), SOCKS5 and HTTP proxies",
   "keywords": [
-    "telegram",
-    "mtproto",
-    "proxy",
     "checker",
     "cli",
-    "validator",
-    "ping",
     "connection-test",
-    "network-tool"
+    "fake-tls",
+    "mtproto",
+    "mtproxy",
+    "network-tool",
+    "ping",
+    "proxy",
+    "socks5",
+    "telegram",
+    "validator"
   ],
   "author": "Erfan Bahramali",
   "license": "MIT",
@@ -34,10 +37,12 @@
   },
   "scripts": {
     "dev": "bun src/index.ts",
-    "clean": "bun run rm -rf dist",
+    "clean": "rm -rf dist",
     "prebuild": "bun run clean",
-    "build": "bun tsc",
-    "prepublishOnly": "bun run build"
+    "build": "tsc",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run typecheck && bun test && bun run build"
   },
   "files": [
     "dist",

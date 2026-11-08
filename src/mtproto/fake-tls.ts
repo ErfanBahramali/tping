@@ -1,212 +1,231 @@
-import { createHmac, randomBytes } from 'crypto';
+import { createHmac, randomBytes, randomInt } from 'crypto';
+import { generateX25519PublicKey } from '../crypto/x25519.js';
+import type { Pipe, SocketStream } from '../net/stream.js';
 
 /**
- * FakeTLS layer for MTProto proxies (secret with "ee" prefix).
+ * Fake TLS layer for MTProto proxies (secret with "ee" prefix), implemented
+ * like Telegram Desktop (mtproto_tls_socket.cpp) and Android (tgnet).
  */
 
+export class FakeTlsError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FakeTlsError';
+  }
+}
+
+/** Offset of the 32-byte random field inside the ClientHello / ServerHello packet. */
+export const RANDOM_OFFSET = 11;
+const RANDOM_LENGTH = 32;
+/** Official clients pad the ClientHello to 517 bytes, like Chrome. */
+const PADDING_TARGET = 513;
+/** Official clients split outgoing data into records of at most this size. */
+export const MAX_CLIENT_RECORD = 2878;
+const MAX_SERVER_RECORD = 16384 + 256;
+
+const SERVER_HELLO_HEADER = Buffer.from('160303', 'hex');
+const SERVER_HELLO_MIDDLE = Buffer.from('140303000101170303', 'hex');
+const CLIENT_PREFIX = Buffer.from('140303000101', 'hex');
+const APP_DATA_HEADER = Buffer.from('170303', 'hex');
+const TLS_ALERT = 0x15;
+
+const hex = (value: string): Buffer => Buffer.from(value.replace(/\s+/g, ''), 'hex');
+
+const u16 = (value: number): Buffer => {
+  const out = Buffer.alloc(2);
+  out.writeUInt16BE(value, 0);
+  return out;
+};
+
+const u24 = (value: number): Buffer => {
+  const out = Buffer.alloc(3);
+  out.writeUIntBE(value, 0, 3);
+  return out;
+};
+
 /**
- * Parse MTProto proxy secret and extract components.
+ * Seven GREASE values (RFC 8701), consecutive pairs forced to differ.
  */
-export interface ParsedSecret {
-  secret: Buffer; // 16 bytes
-  domain?: string; // Optional SNI domain for fake TLS
-  isFakeTLS: boolean;
+const generateGrease = (): Buffer => {
+  const grease = randomBytes(7);
+  for (let i = 0; i < grease.length; i++) {
+    grease[i] = (grease[i] & 0xf0) + 0x0a;
+  }
+  for (let i = 1; i < grease.length; i += 2) {
+    if (grease[i] === grease[i - 1]) {
+      grease[i] ^= 0x10;
+    }
+  }
+  return grease;
+};
+
+const shuffle = <T>(items: readonly T[]): T[] => {
+  const result = [...items];
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = randomInt(i + 1);
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
+};
+
+export interface ClientHello {
+  readonly packet: Buffer;
+  readonly clientRandom: Buffer;
 }
 
 /**
- * Parse MTProto proxy secret (dd or ee prefix).
- *
- * @param secretHex - Hex-encoded secret (with or without dd/ee prefix)
+ * Build the ClientHello exactly like the official clients: Chrome-like cipher
+ * suites and extensions (shuffled), GREASE, a valid x25519 key share, padding
+ * to 517 bytes, and the client random set to HMAC-SHA256(secret, packet) with
+ * the last 4 bytes XORed with the current UNIX time.
  */
-export function parseSecret(secretHex: string): ParsedSecret {
-  const hex = secretHex.toLowerCase().replace(/[^0-9a-f]/g, '');
+export const buildClientHello = (domain: string, key: Buffer, nowMs: number = Date.now()): ClientHello => {
+  const g = generateGrease();
+  const grease = (index: number): Buffer => Buffer.from([g[index], g[index]]);
+  const host = Buffer.from(domain, 'utf8');
 
-  if (hex.startsWith('dd')) {
-    const secret = Buffer.from(hex.slice(2), 'hex');
-    if (secret.length !== 16) {
-      throw new Error('dd secret must be 16 bytes');
-    }
-    return { secret, isFakeTLS: false };
-  }
-
-  if (hex.startsWith('ee')) {
-    const rest = hex.slice(2);
-    if (rest.length < 32) {
-      throw new Error('ee secret must have at least 16 bytes');
-    }
-    const secret = Buffer.from(rest.slice(0, 32), 'hex');
-    const domain = rest.length > 32 ? Buffer.from(rest.slice(32), 'hex').toString('ascii') : undefined;
-    return { secret, domain, isFakeTLS: true };
-  }
-
-  const secret = Buffer.from(hex, 'hex');
-  if (secret.length !== 16) {
-    throw new Error('Secret must be 16 bytes');
-  }
-  return { secret, isFakeTLS: false };
-}
-
-/**
- * TLS record content types.
- */
-export const TLS_RECORD = {
-  CHANGE_CIPHER_SPEC: 0x14,
-  ALERT: 0x15,
-  HANDSHAKE: 0x16,
-  APPLICATION_DATA: 0x17,
-} as const;
-
-/** Random field offset inside the ClientHello record:
- * record header (5) + handshake type (1) + handshake length (3) + client version (2). */
-const RANDOM_OFFSET = 11;
-const RANDOM_LEN = 32;
-
-const u16 = (n: number): Buffer => {
-  const b = Buffer.alloc(2);
-  b.writeUInt16BE(n, 0);
-  return b;
-};
-
-const u24 = (n: number): Buffer => {
-  const b = Buffer.alloc(3);
-  b.writeUIntBE(n, 0, 3);
-  return b;
-};
-
-const extension = (type: number, data: Buffer): Buffer =>
-  Buffer.concat([u16(type), u16(data.length), data]);
-
-/**
- * Build the SNI (server_name) extension.
- */
-const sniExtension = (domain: string): Buffer => {
-  const host = Buffer.from(domain, 'ascii');
-  const list = Buffer.concat([Buffer.from([0x00]), u16(host.length), host]);
-  return extension(0x0000, Buffer.concat([u16(list.length), list]));
-};
-
-/**
- * Generate a FakeTLS ClientHello with a valid HMAC digest in the client random,
- * exactly as official Telegram clients do. The proxy verifies this digest.
- *
- * @param domain - SNI domain from the ee secret
- * @param secret - 16-byte proxy secret
- */
-export function generateFakeTLSClientHello(domain: string, secret: Buffer): Buffer {
-  const sessionId = randomBytes(32);
-  const keyShare = randomBytes(32);
-
-  // Include a trailing GREASE value like real browsers do.
-  const cipherSuites = [
-    0x1301, 0x1302, 0x1303, 0x1305, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9,
-    0xcca8, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035, 0x000a, 0x0a0a,
-  ];
-  const csBuf = Buffer.alloc(cipherSuites.length * 2);
-  cipherSuites.forEach((c, i) => csBuf.writeUInt16BE(c, i * 2));
-
-  const alpn = Buffer.concat([
-    u16(2 + 1 + 2 + 1 + 8), // protocol name list length
-    Buffer.from([2]), Buffer.from('h2', 'ascii'),
-    Buffer.from([8]), Buffer.from('http/1.1', 'ascii'),
+  const extensions = shuffle([
+    Buffer.concat([hex('0000'), u16(host.length + 5), u16(host.length + 3), hex('00'), u16(host.length), host]),
+    hex('0005 0005 01 0000 0000'),
+    Buffer.concat([hex('000a 000a 0008'), grease(4), hex('001d 0017 0018')]),
+    hex('000b 0002 01 00'),
+    hex('000d 0012 0010 0403 0804 0401 0503 0805 0501 0806 0601'),
+    hex('0010 000e 000c 02 6832 08 687474702f312e31'),
+    hex('0012 0000'),
+    hex('0017 0000'),
+    hex('001b 0003 02 0002'),
+    hex('0023 0000'),
+    Buffer.concat([hex('002b 0007 06'), grease(6), hex('0304 0303')]),
+    hex('002d 0002 01 01'),
+    Buffer.concat([hex('0033 002b 0029'), grease(4), hex('0001 00 001d 0020'), generateX25519PublicKey()]),
+    hex('4469 0005 0003 02 6832'),
+    hex('ff01 0001 00'),
   ]);
 
-  const extensions = Buffer.concat([
-    sniExtension(domain),
-    extension(0x0010, alpn), // ALPN
-    extension(0x000a, Buffer.concat([u16(4), u16(0x001d), u16(0x0017)])), // supported_groups: x25519, secp256r1
-    extension(0x000b, Buffer.concat([u16(2), Buffer.from([0x01, 0x00])])), // ec_point_formats: uncompressed
-    extension(0x000d, Buffer.concat([u16(4), u16(0x0804), u16(0x0401)])), // signature_algorithms
-    extension(0x002b, Buffer.concat([u16(4), Buffer.from([0x03, 0x04, 0x03, 0x03])])), // supported_versions: TLS1.3, TLS1.2
-    extension(0x0033, Buffer.concat([u16(2 + 2 + keyShare.length), u16(0x001d), u16(keyShare.length), keyShare])), // key_share x25519
-    extension(0x0016, Buffer.alloc(0)), // encrypt_then_mac
-    extension(0x0017, Buffer.alloc(0)), // extended_master_secret
+  let extensionBlock = Buffer.concat([grease(2), hex('0000'), ...extensions, grease(3), hex('0001 00')]);
+
+  const cipherSuites = Buffer.concat([
+    grease(0),
+    hex('1301 1302 1303 c02b c02f c02c c030 cca9 cca8 c013 c014 009c 009d 002f 0035'),
   ]);
+
+  // record header + handshake header + version + random + session id + suites + compression + ext length
+  const fixedLength = 5 + 4 + 2 + RANDOM_LENGTH + 1 + 32 + 2 + cipherSuites.length + 2 + 2;
+  const unpadded = fixedLength + extensionBlock.length;
+  if (unpadded < PADDING_TARGET) {
+    const size = PADDING_TARGET - unpadded;
+    extensionBlock = Buffer.concat([extensionBlock, hex('0015'), u16(size), Buffer.alloc(size)]);
+  }
 
   const body = Buffer.concat([
-    Buffer.from([0x03, 0x03]), // client version TLS 1.2
-    Buffer.alloc(RANDOM_LEN), // placeholder: random filled below
-    Buffer.from([sessionId.length]), sessionId,
-    u16(csBuf.length), csBuf,
-    Buffer.from([0x01, 0x00]), // compression methods: null
-    u16(extensions.length), extensions,
+    hex('0303'),
+    Buffer.alloc(RANDOM_LENGTH),
+    hex('20'),
+    randomBytes(32),
+    u16(cipherSuites.length),
+    cipherSuites,
+    hex('0100'),
+    u16(extensionBlock.length),
+    extensionBlock,
   ]);
+  const handshake = Buffer.concat([hex('01'), u24(body.length), body]);
+  const packet = Buffer.concat([hex('160301'), u16(handshake.length), handshake]);
 
-  const handshake = Buffer.concat([Buffer.from([0x01]), u24(body.length), body]); // ClientHello
-  const packet = Buffer.concat([
-    Buffer.from([TLS_RECORD.HANDSHAKE, 0x03, 0x01]), u16(handshake.length), handshake,
-  ]);
-
-  // Client random = HMAC(secret, handshake with zeroed random); last 4 bytes = UNIX timestamp (LE).
-  const digest = createHmac('sha256', secret).update(packet).digest();
-  digest.writeUInt32LE(Math.floor(Date.now() / 1000) >>> 0, RANDOM_LEN - 4);
+  const digest = createHmac('sha256', key).update(packet).digest();
+  const timestamp = Math.floor(nowMs / 1000) >>> 0;
+  digest.writeUInt32LE((digest.readUInt32LE(28) ^ timestamp) >>> 0, 28);
   digest.copy(packet, RANDOM_OFFSET);
 
-  return packet;
+  return { packet, clientRandom: Buffer.from(digest) };
+};
+
+/**
+ * Check the proxy's ServerHello: HMAC-SHA256(secret, clientRandom || response
+ * with the random field zeroed) must equal the random field.
+ */
+export const verifyServerHello = (response: Buffer, clientRandom: Buffer, key: Buffer): boolean => {
+  if (response.length < RANDOM_OFFSET + RANDOM_LENGTH) {
+    return false;
+  }
+  const zeroed = Buffer.from(response);
+  zeroed.fill(0, RANDOM_OFFSET, RANDOM_OFFSET + RANDOM_LENGTH);
+  const expected = createHmac('sha256', key).update(clientRandom).update(zeroed).digest();
+  return expected.equals(response.subarray(RANDOM_OFFSET, RANDOM_OFFSET + RANDOM_LENGTH));
+};
+
+/**
+ * TLS record wrapper used after the handshake.
+ * Outgoing: one ChangeCipherSpec prefix, then Application Data records of at most 2878 bytes.
+ * Incoming: only Application Data records are accepted.
+ */
+export class FakeTlsPipe implements Pipe {
+  private prefixSent = false;
+  private incoming: Buffer = Buffer.alloc(0);
+
+  constructor(private readonly inner: Pipe) {}
+
+  write(data: Buffer): void {
+    const parts: Buffer[] = [];
+    if (!this.prefixSent) {
+      parts.push(CLIENT_PREFIX);
+      this.prefixSent = true;
+    }
+    for (let offset = 0; offset < data.length; offset += MAX_CLIENT_RECORD) {
+      const chunk = data.subarray(offset, Math.min(offset + MAX_CLIENT_RECORD, data.length));
+      parts.push(APP_DATA_HEADER, u16(chunk.length), chunk);
+    }
+    this.inner.write(Buffer.concat(parts));
+  }
+
+  async read(length: number): Promise<Buffer> {
+    while (this.incoming.length < length) {
+      const header = await this.inner.read(5);
+      if (!header.subarray(0, 3).equals(APP_DATA_HEADER)) {
+        throw new FakeTlsError(`Unexpected TLS record type 0x${header[0].toString(16)} from proxy`);
+      }
+      const size = header.readUInt16BE(3);
+      if (size > MAX_SERVER_RECORD) {
+        throw new FakeTlsError('TLS record from proxy is too large');
+      }
+      const body = await this.inner.read(size);
+      this.incoming = Buffer.concat([this.incoming, body]);
+    }
+    const out = this.incoming.subarray(0, length);
+    this.incoming = this.incoming.subarray(length);
+    return out;
+  }
 }
 
 /**
- * Wrap data into TLS Application Data record(s).
+ * Perform the fake TLS handshake. Like the official clients, the response must
+ * be exactly: ServerHello record, ChangeCipherSpec (1 byte), one Application
+ * Data record; anything else is rejected.
  */
-export function wrapInTLSRecords(data: Buffer): Buffer {
-  const MAX_CHUNK_SIZE = 16384;
-  const chunks: Buffer[] = [];
-  for (let i = 0; i < data.length; i += MAX_CHUNK_SIZE) {
-    const chunk = data.subarray(i, Math.min(i + MAX_CHUNK_SIZE, data.length));
-    const record = Buffer.alloc(5 + chunk.length);
-    record.writeUInt8(TLS_RECORD.APPLICATION_DATA, 0);
-    record.writeUInt16BE(0x0303, 1);
-    record.writeUInt16BE(chunk.length, 3);
-    chunk.copy(record, 5);
-    chunks.push(record);
+export const fakeTlsHandshake = async (stream: SocketStream, key: Buffer, domain: string): Promise<FakeTlsPipe> => {
+  const hello = buildClientHello(domain, key);
+  stream.write(hello.packet);
+
+  const first = await stream.read(5);
+  if (first[0] === TLS_ALERT) {
+    throw new FakeTlsError('Proxy answered with a TLS alert (ClientHello rejected)');
   }
-  return Buffer.concat(chunks);
-}
-
-/**
- * Extract complete TLS record payloads from a stream buffer.
- *
- * @returns Concatenated payload of complete records and the remaining (incomplete) buffer
- */
-export function extractTlsRecords(buffer: Buffer): { payload: Buffer; rest: Buffer } {
-  let offset = 0;
-  let payload = Buffer.alloc(0);
-  while (buffer.length - offset >= 5) {
-    const len = buffer.readUInt16BE(offset + 3);
-    if (buffer.length - offset < 5 + len) break;
-    payload = Buffer.concat([payload, buffer.subarray(offset + 5, offset + 5 + len)]);
-    offset += 5 + len;
+  if (!first.subarray(0, 3).equals(SERVER_HELLO_HEADER)) {
+    throw new FakeTlsError('Not a fake-TLS proxy (response is not a TLS ServerHello)');
   }
-  return { payload, rest: buffer.subarray(offset) };
-}
-
-/**
- * Try to read and verify the proxy's ServerHello response.
- * The proxy answers with exactly 3 records: ServerHello + ChangeCipherSpec + noise AppData,
- * placing HMAC(secret, clientRandom || records-with-zeroed-digest) at RANDOM_OFFSET.
- *
- * @returns 'incomplete' while waiting for more bytes, 'valid' or 'invalid' when decided
- */
-export function tryVerifyFakeTLSServerHello(
-  buffer: Buffer,
-  clientRandom: Buffer,
-  secret: Buffer
-): 'incomplete' | 'valid' | 'invalid' {
-  let offset = 0;
-  for (let i = 0; i < 3; i++) {
-    if (buffer.length - offset < 5) return 'incomplete';
-    offset += 5 + buffer.readUInt16BE(offset + 3);
+  const helloBody = await stream.read(first.readUInt16BE(3));
+  const middle = await stream.read(SERVER_HELLO_MIDDLE.length);
+  if (!middle.equals(SERVER_HELLO_MIDDLE)) {
+    throw new FakeTlsError('Unexpected fake-TLS ServerHello layout (looks like a real TLS server, not the proxy)');
   }
-  if (buffer.length < offset) return 'incomplete';
+  const appLength = await stream.read(2);
+  const appBody = await stream.read(appLength.readUInt16BE(0));
 
-  const packet = buffer.subarray(0, offset);
-  if (packet[0] !== TLS_RECORD.HANDSHAKE) return 'invalid';
+  const response = Buffer.concat([first, helloBody, middle, appLength, appBody]);
+  if (!verifyServerHello(response, hello.clientRandom, key)) {
+    throw new FakeTlsError(
+      'Fake-TLS verification failed: wrong secret, or the real site answered instead of the proxy (check system clock too)'
+    );
+  }
 
-  const mac = createHmac('sha256', secret)
-    .update(clientRandom)
-    .update(packet.subarray(0, RANDOM_OFFSET))
-    .update(Buffer.alloc(RANDOM_LEN))
-    .update(packet.subarray(RANDOM_OFFSET + RANDOM_LEN))
-    .digest();
-
-  return mac.equals(packet.subarray(RANDOM_OFFSET, RANDOM_OFFSET + RANDOM_LEN)) ? 'valid' : 'invalid';
-}
+  return new FakeTlsPipe(stream);
+};

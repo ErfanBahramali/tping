@@ -1,124 +1,89 @@
+import { randomBytes } from 'crypto';
+
+const REQ_PQ_MULTI = 0xbe7e8ef1;
+const RES_PQ = 0x05162463;
+
 /**
- * Generate MTProto message_id.
- * Format: time.time() * 2^32, must be divisible by 4
- * Client message IDs must be divisible by 4
+ * Client message_id: unixtime * 2^32, divisible by 4.
  */
-export function generateMessageId(): bigint {
-  // Get current time in seconds (with milliseconds as decimal)
-  const now = Date.now() / 1000; // seconds with decimal
+export const generateMessageId = (nowMs: number = Date.now()): bigint => {
+  const seconds = BigInt(Math.floor(nowMs / 1000));
+  const fraction = BigInt(Math.floor(((nowMs % 1000) / 1000) * 2 ** 32));
+  return ((seconds << 32n) | fraction) & ~3n;
+};
 
-  // Multiply by 2^32
-  let msgId = BigInt(Math.floor(now * 2 ** 32));
+/**
+ * Unencrypted message: auth_key_id (0) + message_id + length + body.
+ */
+export const buildUnencryptedMessage = (body: Buffer, messageId: bigint = generateMessageId()): Buffer => {
+  const header = Buffer.alloc(20);
+  header.writeBigInt64LE(messageId, 8);
+  header.writeUInt32LE(body.length, 16);
+  return Buffer.concat([header, body]);
+};
 
-  // Must be divisible by 4 (client messages)
-  msgId = (msgId / 4n) * 4n;
+/**
+ * req_pq_multi#be7e8ef1 nonce:int128 = ResPQ;
+ */
+export const buildReqPqMulti = (nonce: Buffer = randomBytes(16)): { readonly message: Buffer; readonly nonce: Buffer } => {
+  const body = Buffer.alloc(20);
+  body.writeUInt32LE(REQ_PQ_MULTI, 0);
+  nonce.copy(body, 4);
+  return { message: buildUnencryptedMessage(body), nonce };
+};
 
-  return msgId;
+export interface ResPQ {
+  readonly nonce: Buffer;
+  readonly serverNonce: Buffer;
 }
 
 /**
- * Build req_pq_multi message.
- * TL Schema: req_pq_multi#be7e8ef1 nonce:int128 = ResPQ;
+ * Parse an unencrypted resPQ message (transport framing already removed;
+ * trailing transport padding is allowed).
  *
- * @param nonce - 16-byte random nonce
- * @returns TL-serialized message
+ * resPQ#05162463 nonce:int128 server_nonce:int128 pq:string server_public_key_fingerprints:Vector<long> = ResPQ;
  */
-export function buildReqPqMulti(nonce: Buffer): Buffer {
-  // Constructor ID: 0xbe7e8ef1 (little-endian)
-  const constructor = Buffer.from([0xf1, 0x8e, 0x7e, 0xbe]);
-
-  return Buffer.concat([constructor, nonce]);
-}
-
-/**
- * Build unencrypted MTProto message wrapper.
- *
- * Format:
- * - auth_key_id: 8 bytes (all zeros for unencrypted)
- * - message_id: 8 bytes
- * - message_length: 4 bytes
- * - message: N bytes
- *
- * @param tlMessage - TL-serialized message
- * @param messageId - Message ID
- * @returns Unencrypted message
- */
-export function buildUnencryptedMessage(
-  tlMessage: Buffer,
-  messageId: bigint
-): Buffer {
-  const authKeyId = Buffer.alloc(8, 0); // All zeros
-
-  const msgIdBuf = Buffer.alloc(8);
-  msgIdBuf.writeBigInt64LE(messageId, 0);
-
-  const msgLen = Buffer.alloc(4);
-  msgLen.writeUInt32LE(tlMessage.length, 0);
-
-  return Buffer.concat([authKeyId, msgIdBuf, msgLen, tlMessage]);
-}
-
-/**
- * Add Intermediate protocol length prefix.
- *
- * @param payload - Message payload
- * @returns Payload with length prefix
- */
-export function addLengthPrefix(payload: Buffer): Buffer {
-  const length = Buffer.alloc(4);
-  length.writeUInt32LE(payload.length, 0);
-
-  return Buffer.concat([length, payload]);
-}
-
-/**
- * Parse ResPQ response.
- * TL Schema: resPQ#05162463 nonce:int128 server_nonce:int128 pq:string server_public_key_fingerprints:Vector<long> = ResPQ;
- *
- * @param data - Decrypted response data
- * @returns Parsed response or null if invalid
- */
-export function parseResPQ(
-  data: Buffer
-): { nonce: Buffer; serverNonce: Buffer; constructor: number } | null {
-  try {
-    let offset = 0;
-
-    // Intermediate frame: 4-byte LE length prefix, then the unencrypted
-    // MTProto envelope: auth_key_id(8) + message_id(8) + body_length(4) + body.
-    if (data.length < 4) return null;
-    const length = data.readUInt32LE(offset);
-    offset += 4;
-    if (data.length < 4 + length) return null;
-
-    // Parse auth_key_id (8 bytes) - should be all zeros
-    const authKeyId = data.slice(offset, offset + 8);
-    offset += 8;
-    if (!authKeyId.equals(Buffer.alloc(8, 0))) return null;
-
-    // Parse message_id (8 bytes) - skip
-    offset += 8;
-
-    // Parse message_length (4 bytes) - skip
-    offset += 4;
-
-    // Parse constructor (4 bytes)
-    const constructor = data.readUInt32LE(offset);
-    offset += 4;
-
-    // Valid constructors: 0x05162463 or 0x83c95aec
-    if (constructor !== 0x05162463 && constructor !== 0x83c95aec) {
-      return null;
-    }
-    // Parse nonce (16 bytes)
-    const nonce = data.slice(offset, offset + 16);
-    offset += 16;
-
-    // Parse server_nonce (16 bytes)
-    const serverNonce = data.slice(offset, offset + 16);
-
-    return { nonce, serverNonce, constructor };
-  } catch (err) {
+export const parseResPQ = (data: Buffer): ResPQ | null => {
+  if (data.length < 20 + 4 + 32) {
     return null;
   }
-}
+  if (data.readBigUInt64LE(0) !== 0n) {
+    return null;
+  }
+  const bodyLength = data.readUInt32LE(16);
+  if (bodyLength < 36 || 20 + bodyLength > data.length) {
+    return null;
+  }
+  if (data.readUInt32LE(20) !== RES_PQ) {
+    return null;
+  }
+  return {
+    nonce: Buffer.from(data.subarray(24, 40)),
+    serverNonce: Buffer.from(data.subarray(40, 56)),
+  };
+};
+
+/**
+ * Parse a req_pq_multi message (used by tests and mock servers).
+ */
+export const parseReqPqMulti = (data: Buffer): Buffer | null => {
+  if (data.length < 40 || data.readBigUInt64LE(0) !== 0n || data.readUInt32LE(20) !== REQ_PQ_MULTI) {
+    return null;
+  }
+  return Buffer.from(data.subarray(24, 40));
+};
+
+/**
+ * Build a resPQ reply for the given nonce (used by tests and mock servers).
+ */
+export const buildResPQ = (nonce: Buffer): Buffer => {
+  const pq = Buffer.from([0x08, 0x17, 0xed, 0x48, 0x94, 0x1a, 0x08, 0xf9, 0x81, 0x00, 0x00, 0x00]);
+  const fingerprints = Buffer.alloc(16);
+  fingerprints.writeUInt32LE(0x1cb5c415, 0); // vector constructor
+  fingerprints.writeUInt32LE(1, 4);
+  fingerprints.writeBigUInt64LE(0xc3b42b026ce86b21n, 8);
+  const body = Buffer.concat([Buffer.alloc(4), nonce, randomBytes(16), pq, fingerprints]);
+  body.writeUInt32LE(RES_PQ, 0);
+  const message = buildUnencryptedMessage(body, (generateMessageId() | 1n));
+  return message;
+};

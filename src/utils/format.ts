@@ -78,7 +78,8 @@ const formatSuccess = (result: CheckResult, verbose: boolean): string => {
 };
 
 const formatFailure = (result: CheckResult): string => {
-  if (result.dcs.length <= 1) {
+  const errors = new Set(result.dcs.map((dc) => dc.error));
+  if (result.dcs.length <= 1 || (errors.size === 1 && result.dcs.every((dc) => !dc.success))) {
     return chalk.red(result.error ?? 'Failed');
   }
   return result.dcs

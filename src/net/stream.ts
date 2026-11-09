@@ -32,11 +32,15 @@ export class SocketStream implements Pipe {
   private connected: boolean;
   readonly socket: Socket;
 
-  constructor(socket?: Socket) {
+  /**
+   * @param socket - existing socket; treated as connected unless `readyEvent` is given
+   * @param readyEvent - event that marks the socket as ready (e.g. 'secureConnect' for TLS)
+   */
+  constructor(socket?: Socket, readyEvent?: string) {
     this.socket = socket ?? new Socket();
-    this.connected = socket !== undefined;
+    this.connected = socket !== undefined && readyEvent === undefined;
     this.socket.setNoDelay(true);
-    this.socket.on('connect', () => {
+    this.socket.on(readyEvent ?? 'connect', () => {
       this.connected = true;
       this.pending?.();
     });
@@ -52,6 +56,11 @@ export class SocketStream implements Pipe {
     if (!this.failure) {
       this.socket.connect({ host, port });
     }
+    return this.ready();
+  }
+
+  /** Resolves once the socket is connected (or its ready event fired). */
+  ready(): Promise<void> {
     return this.waitFor(() => (this.connected ? true : undefined)).then(() => undefined);
   }
 
@@ -87,6 +96,23 @@ export class SocketStream implements Pipe {
       const end = index + delimiter.length;
       const out = Buffer.from(this.buffer.subarray(0, end));
       this.buffer = this.buffer.subarray(end);
+      return out;
+    });
+  }
+
+  /**
+   * Read everything until the remote side closes the connection.
+   */
+  readToEnd(maxLength: number): Promise<Buffer> {
+    return this.waitFor(() => {
+      if (this.buffer.length > maxLength) {
+        throw new Error('Response body too large');
+      }
+      if (!(this.failure instanceof StreamClosedError)) {
+        return undefined;
+      }
+      const out = Buffer.from(this.buffer);
+      this.buffer = Buffer.alloc(0);
       return out;
     });
   }

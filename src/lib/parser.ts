@@ -1,12 +1,13 @@
 import { readFileSync, statSync } from 'fs';
 import type { TelegramProxy } from '../types/index.js';
+import { decodeWebSecret, parseWebProxyServer } from '../webproxy/link.js';
 
 /**
  * Supported inputs:
  *   https://t.me/proxy?server=..&port=..&secret=..      (also telegram.me, telegram.dog, www., http://, no scheme)
  *   tg://proxy?server=..&port=..&secret=..              (also tg:proxy)
  *   https://t.me/socks?server=..&port=..&user=..&pass=.. / tg://socks?...
- *   tg://webproxy?server=..&secret=.. / https://t.me/webproxy?...   (recognized, not checkable)
+ *   tg://webproxy?server=host[/path]&secret=.. / https://t.me/webproxy?...   (WEB proxy, port 443)
  *   socks5://user:pass@host:port                        (also socks://, socks5h://)
  *   http://user:pass@host:port                          (HTTP proxy, Telegram Desktop)
  */
@@ -68,18 +69,36 @@ const decodeUserInfo = (value: string): string | undefined => {
   }
 };
 
-const fromQuery = (kind: string, params: URLSearchParams): Outcome => {
-  const server = cleanServer(params.get('server'));
+const fromWebQuery = (params: URLSearchParams): Outcome => {
+  const server = (params.get('server') ?? params.get('host') ?? '').trim();
   if (!server) {
     return { reason: 'server is missing' };
   }
+  const address = parseWebProxyServer(server);
+  if (typeof address === 'string') {
+    return { reason: address };
+  }
+  const secretText = params.get('secret')?.trim();
+  if (!secretText) {
+    return { reason: 'secret is missing' };
+  }
+  const secret = decodeWebSecret(secretText, address.basePath !== '');
+  if (typeof secret === 'string') {
+    return { reason: secret };
+  }
+  return {
+    proxy: { type: 'web', server: address.host, port: 443, basePath: address.basePath, secret: secret.toString('hex') },
+  };
+};
 
+const fromQuery = (kind: string, params: URLSearchParams): Outcome => {
   if (kind === 'webproxy') {
-    const secret = params.get('secret')?.trim();
-    if (!secret) {
-      return { reason: 'secret is missing' };
-    }
-    return { proxy: { type: 'web', server, port: 443, secret } };
+    return fromWebQuery(params);
+  }
+
+  const server = cleanServer(params.get('server'));
+  if (!server) {
+    return { reason: 'server is missing' };
   }
 
   const port = parsePort(params.get('port')?.trim());

@@ -1,6 +1,6 @@
 /**
  * Proxy types supported by the official Telegram clients.
- * `http` is Telegram Desktop only; `web` (WEB-Proxy) is recognized but not checked.
+ * `http` is Telegram Desktop only; `web` is the WEB proxy (telegramdesktop/tproxy-server).
  */
 export type ProxyType = 'mtproto' | 'socks5' | 'http' | 'web';
 
@@ -29,8 +29,16 @@ export interface HTTPProxy extends BaseProxy {
 
 export interface WebProxy extends BaseProxy {
   readonly type: 'web';
+  /** Lowercase ASCII hostname (port is always 443). */
+  readonly server: string;
+  /** Base path without slashes; empty for a root deployment. */
+  readonly basePath: string;
+  /** MTProxy secret in hex: 16 bytes, or 17 starting with dd (path marker already removed). */
   readonly secret: string;
 }
+
+/** How a WEB proxy relay carries the streams (chosen by the relay). */
+export type CarrierMode = 'https' | 'https-lanes' | 'websocket' | 'websocket-lanes';
 
 export type TelegramProxy = MTProtoProxy | SOCKS5Proxy | HTTPProxy | WebProxy;
 
@@ -55,8 +63,8 @@ export interface DcResult {
   /** Total time, from TCP connect to resPQ (what the official clients show as ping). */
   readonly latency?: number;
   readonly timings?: Timings;
-  /** Set when the HTTP proxy only worked with the HTTP transport. */
-  readonly via?: 'http-transport';
+  /** HTTP transport fallback (HTTP proxies) or the carrier mode (WEB proxies). */
+  readonly via?: 'http-transport' | CarrierMode;
   readonly error?: string;
 }
 

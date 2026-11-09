@@ -37,12 +37,17 @@ export const formatProxyType = (proxy: TelegramProxy): string => {
     case 'http':
       return chalk.blue('HTTP');
     default:
-      return chalk.yellow('WEB-Proxy');
+      return chalk.yellow(`WEB · ${proxy.secret.length === 34 ? 'dd' : 'simple'}`);
   }
 };
 
+const shorten = (text: string): string => (text.length > 30 ? `${text.substring(0, 27)}...` : text);
+
 export const formatProxyAddress = (proxy: TelegramProxy): string => {
-  const server = proxy.server.length > 30 ? `${proxy.server.substring(0, 27)}...` : proxy.server;
+  if (proxy.type === 'web') {
+    return shorten(proxy.basePath ? `${proxy.server}/${proxy.basePath}` : proxy.server);
+  }
+  const server = shorten(proxy.server);
   return `${server.includes(':') ? `[${server}]` : server}:${proxy.port}`;
 };
 
@@ -60,7 +65,8 @@ const formatTimings = (dc: DcResult): string => {
 };
 
 const formatSuccess = (result: CheckResult, verbose: boolean): string => {
-  const via = result.dcs.some((dc) => dc.via === 'http-transport') ? chalk.gray(' via HTTP transport') : '';
+  const carrier = result.dcs.find((dc) => dc.via)?.via;
+  const via = carrier ? chalk.gray(` via ${carrier === 'http-transport' ? 'HTTP transport' : carrier}`) : '';
   if (result.dcs.length <= 1) {
     const dc = result.dcs[0];
     return `${formatLatency(result.latency ?? 0)}${verbose && dc ? formatTimings(dc) : ''}${via}`;

@@ -6,6 +6,7 @@ import { InvalidArgumentError, Option, program } from 'commander';
 import { parseProxies } from './lib/parser.js';
 import { pingProxies } from './lib/ping.js';
 import { DC_IDS, DEFAULT_DC } from './lib/datacenters.js';
+import { waitForWebProxyCleanup } from './webproxy/check.js';
 
 const { version } = createRequire(import.meta.url)('../package.json') as { version: string };
 
@@ -61,6 +62,8 @@ Supported proxy formats:
   SOCKS5:   https://t.me/socks?server=...&port=...&user=...&pass=...   (also tg://socks?...)
             socks5://user:pass@host:port
   HTTP:     http://user:pass@host:port   (Telegram Desktop only)
+  WEB:      https://t.me/webproxy?server=host[/path]&secret=...   (also tg://webproxy?...)
+            HTTPS on port 443 through a tproxy-server relay; secret: 32 hex or dd + 32 hex
 
 A ping succeeds only when a Telegram datacenter answers through the proxy.
 Exit status: 0 if every proxy answered at least once, 1 otherwise, 2 on bad input.
@@ -125,6 +128,7 @@ Examples:
     );
 
     const allAnswered = results.every((list) => list.some((r) => r.success));
+    await waitForWebProxyCleanup();
     process.exit(allAnswered ? 0 : 1);
   });
 

@@ -8,7 +8,7 @@ TPing connects through the proxy exactly like the official Telegram apps (Androi
 
 ## ✨ Features
 
-- 🔐 **Every official proxy type**: MTProto with simple, `dd`, and Fake TLS (`ee`) secrets, SOCKS5 with or without login, and HTTP (Telegram Desktop)
+- 🔐 **Every official proxy type**: MTProto with simple, `dd`, and Fake TLS (`ee`) secrets, SOCKS5 with or without login, HTTP (Telegram Desktop), and the new WEB proxy (all four carrier modes)
 - 🤝 **Real handshake**: a `req_pq_multi` request goes through the proxy to the Telegram datacenter and must come back with our nonce
 - 🌐 **Datacenter selection**: test DC 2 (default), any set of DCs, or all five
 - 🏓 **Continuous mode** like `ping`, with count and interval
@@ -79,6 +79,7 @@ tping -V -c 3 proxies.txt
 | MTProto | `https://t.me/proxy?server=…&port=…&secret=…`, also `telegram.me`, `telegram.dog`, `www.`, `http://`, no scheme, `tg://proxy?…`, `tg:proxy?…` |
 | SOCKS5 | `https://t.me/socks?server=…&port=…&user=…&pass=…`, `tg://socks?…`, `socks5://user:pass@host:port` |
 | HTTP | `http://user:pass@host:port` (HTTP proxies are only supported by Telegram Desktop) |
+| WEB | `https://t.me/webproxy?server=host[/path]&secret=…`, `tg://webproxy?…` (always HTTPS on port 443) |
 
 MTProto secrets may be hex or base64/base64url, like in the official apps:
 
@@ -88,7 +89,9 @@ MTProto secrets may be hex or base64/base64url, like in the official apps:
 | `dd` + 16 bytes | secure | obfuscated padded intermediate transport |
 | `ee` + 16 bytes + domain | Fake TLS | TLS-looking handshake with the domain as SNI, then padded intermediate inside TLS records |
 
-Shell-escaped links (`t.me/proxy\?server\=…`) are accepted. Invalid lines are reported and skipped. WEB-Proxy links (`tg://webproxy`) are recognized but not checked yet, because there is no official protocol specification.
+WEB proxy secrets are 16 bytes or `dd` + 16 bytes (no Fake TLS). A link whose server has a base path (`host%2Fpath`) carries the secret in its marked form (`0x70` + secret, base64url), as the official installer generates it.
+
+Shell-escaped links (`t.me/proxy\?server\=…`) are accepted. Invalid lines are reported and skipped.
 
 ---
 
@@ -112,6 +115,8 @@ TPing builds the same connection as the official apps:
 2. **Transport obfuscation**: a random 64-byte header carries the protocol tag and the DC id, encrypted with AES-256-CTR keys derived from the secret ([MTProto transport obfuscation](https://core.telegram.org/mtproto/mtproto-transports#transport-obfuscation)).
 3. **MTProto ping**: a `req_pq_multi` request is sent and a `resPQ` with the same nonce must come back from the Telegram datacenter.
 
+For **WEB proxies** ([tproxy-server](https://github.com/telegramdesktop/tproxy-server)), TPing does what the Telegram app and its bridge page do together. It derives the bridge capability (HMAC-SHA256 of the hostname, and base path if any, keyed with the secret) and loads `https://host/?bridge=…` with full certificate checks. It then creates a relay session (HELLO → WELCOME) and opens one stream per tested DC, carrying the normal obfuscated MTProxy bytes until the DC answers. All four carrier modes the relay can choose are supported: `https`, `https-lanes`, `websocket` and `websocket-lanes`. The session is deleted afterwards so it does not take up a slot on the relay. The official apps skip WEB proxies in their availability checks; TPing tests them for real.
+
 For SOCKS5 and HTTP proxies, TPing opens a tunnel to the Telegram datacenter's IP and runs the same obfuscated MTProto handshake through it. For HTTP proxies that refuse `CONNECT`, it falls back to the HTTP transport, as Telegram Desktop does.
 
 The reported latency covers the whole sequence, TCP connect + proxy handshake + Telegram round trip, which is the same thing the official apps show as a proxy's ping. With several DCs, the slowest DC is reported and each DC is listed.
@@ -122,7 +127,7 @@ The reported latency covers the whole sequence, TCP connect + proxy handshake + 
 
 ```bash
 bun install
-bun test          # unit tests + end-to-end tests against local mock servers
+bun test          # unit tests + end-to-end tests against local mock servers (MTProxy, Fake TLS, SOCKS5, HTTP, WEB relay)
 bun run build
 TPING_LIVE_PROXY="https://t.me/proxy?server=…&port=…&secret=…" bun test   # also test a real proxy
 ```

@@ -12,8 +12,12 @@ import { buildReqPqMulti, buildResPQ, parseReqPqMulti, parseResPQ } from '../src
 import { AESCTR } from '../src/crypto/aes-ctr.js';
 import { isOnCurve } from '../src/crypto/x25519.js';
 import { checkProxy, type CheckOptions } from '../src/lib/checker.js';
+import { waitForWebProxyCleanup } from '../src/webproxy/check.js';
 import type { Pipe } from '../src/net/stream.js';
-import type { TelegramProxy } from '../src/types/index.js';
+import type { CarrierMode, TelegramProxy } from '../src/types/index.js';
+import { deriveCapability, decodeWebSecret } from '../src/webproxy/link.js';
+import { FRAME, decodeWebFrames, encodeWebFrame } from '../src/webproxy/frames.js';
+import { createCertificate, hasOpenssl, startMockRelay, type TestCertificate } from './helpers/mock-relay.js';
 import {
   startMockDatacenter,
   startMockHttpProxy,
@@ -79,8 +83,27 @@ describe('parser', () => {
     });
   });
 
-  test('WEB-Proxy links are recognized', () => {
-    expect(proxyOf(`tg://webproxy?server=web.example.com&secret=${KEY_HEX}`)).toMatchObject({ type: 'web', port: 443 });
+  test('WEB proxy links', () => {
+    expect(proxyOf(`https://t.me/webproxy?server=Web.Example.com&secret=${KEY_HEX}`)).toEqual({
+      type: 'web', server: 'web.example.com', port: 443, basePath: '', secret: KEY_HEX,
+    });
+    expect(proxyOf(`tg://webproxy?host=web.example.com&secret=dd${KEY_HEX}`)).toMatchObject({ secret: `dd${KEY_HEX}` });
+    // Official base path example from tproxy-server README.
+    expect(proxyOf('https://t.me/webproxy?server=proxy.example.com%2Fphcf2vfe7zgbrslg&secret=cIVhlEBk_HMMv6RHNWLY7Fk')).toEqual({
+      type: 'web', server: 'proxy.example.com', port: 443, basePath: 'phcf2vfe7zgbrslg', secret: '8561944064fc730cbfa4473562d8ec59',
+    });
+  });
+
+  test.each([
+    [`tg://webproxy?server=proxy.example.com%2Fpath&secret=${KEY_HEX}`, 'marked secret'],
+    [`tg://webproxy?server=1.2.3.4&secret=${KEY_HEX}`, 'IP addresses'],
+    [`tg://webproxy?server=proxy.example.com%2F..&secret=cIVhlEBk_HMMv6RHNWLY7Fk`, 'base path segments'],
+    [`tg://webproxy?server=proxy.example.com&secret=${EE_SECRET}`, 'Fake TLS'],
+    ['tg://webproxy?server=proxy.example.com&secret=00', 'must be 16 bytes'],
+    ['tg://webproxy?server=proxy.example.com&secret=a!b', 'neither hex'],
+  ])('rejects WEB link %s', (link, reason) => {
+    const outcome = parseProxyString(link);
+    expect('reason' in outcome && outcome.reason).toContain(reason);
   });
 
   test.each([
@@ -407,10 +430,114 @@ describe('end-to-end with mock servers', () => {
     expect(result.dcs[0].via).toBe('http-transport');
   });
 
-  test('WEB-Proxy is reported as unsupported', async () => {
-    const result = await checkProxy(proxyOf(`tg://webproxy?server=x.com&secret=${KEY_HEX}`), options());
+});
+
+describe('WEB proxy protocol', () => {
+  // Vectors from tproxy-server PROTOCOL.md and BASE_PATH.md.
+  test.each([
+    ['', '000102030405060708090a0b0c0d0e0f', 'MHLEY5PmW1GWqJkSrlmJpvJUiLhBH_QKy6yKg8a0JPk'],
+    ['', 'dd000102030405060708090a0b0c0d0e0f', 'IpJrt3e7sKtzPyoXy6w-Zj6GGEvsvclN66JzQEfPYLA'],
+    ['dobry-cola-super-app', '000102030405060708090a0b0c0d0e0f', 'hHz99Xs93EN1j91G9gpNepXwGNNt5YdAFkEVk_LlqdQ'],
+    ['dobry-cola-super-app', 'dd000102030405060708090a0b0c0d0e0f', 'TGUkZaevsavLbHvlNWipnRoYxgzZ51ioWvbxgGT3wHo'],
+  ])('capability vector (path "%s", secret %s)', (basePath, secret, expected) => {
+    expect(deriveCapability({ host: 'proxy.example.com', basePath }, Buffer.from(secret, 'hex'))).toBe(expected);
+  });
+
+  test('marked secret vector', () => {
+    expect((decodeWebSecret('cIVhlEBk_HMMv6RHNWLY7Fk', true) as Buffer).toString('hex')).toBe('8561944064fc730cbfa4473562d8ec59');
+  });
+
+  test('frame codec', () => {
+    const batch = Buffer.concat([encodeWebFrame(FRAME.OPEN, 7), encodeWebFrame(FRAME.DATA, 7, Buffer.from('abc'))]);
+    expect(batch.subarray(0, 8).toString('hex')).toBe('0100000700000000');
+    expect(decodeWebFrames(batch).map((f) => [f.type, f.streamId, f.payload.toString()])).toEqual([[1, 7, ''], [2, 7, 'abc']]);
+    expect(() => decodeWebFrames(Buffer.from('0200000100000000', 'hex'))).toThrow();
+    expect(() => decodeWebFrames(Buffer.from('02000001000000ff00', 'hex'))).toThrow();
+  });
+});
+
+describe.skipIf(!hasOpenssl())('WEB proxy end-to-end with a mock relay', () => {
+  const HOST = 'proxy.test';
+  let certificate: TestCertificate;
+  let backend: MockServer;
+  const seen: SeenRequest[] = [];
+
+  beforeAll(async () => {
+    certificate = createCertificate(HOST);
+    backend = await startMockMtproxy({ key: KEY, onSeen: (s) => seen.push(s) });
+  });
+
+  afterAll(async () => {
+    await backend.close();
+  });
+
+  const run = async (carrier: CarrierMode, secret: string, extra: { basePath?: string; dcs?: number[]; rejectStreams?: boolean; link?: string; trustCa?: boolean } = {}) => {
+    const relay = await startMockRelay({
+      hostname: HOST,
+      basePath: extra.basePath,
+      secret: Buffer.from(secret, 'hex'),
+      carrier,
+      backendPort: backend.port,
+      certificate,
+      rejectStreams: extra.rejectStreams,
+    });
+    try {
+      const link = extra.link ?? `tg://webproxy?server=${HOST}&secret=${secret}`;
+      const result = await checkProxy(proxyOf(link), {
+        timeout: 4000,
+        dcs: extra.dcs,
+        webProxyEndpoint: { host: '127.0.0.1', port: relay.port, ca: extra.trustCa === false ? undefined : certificate.cert },
+      });
+      await waitForWebProxyCleanup();
+      return { result, stats: { ...relay.stats } };
+    } finally {
+      await relay.close();
+    }
+  };
+
+  test.each(['https', 'https-lanes', 'websocket', 'websocket-lanes'] as const)('%s carrier, all DCs in one session', async (carrier) => {
+    seen.length = 0;
+    const { result, stats } = await run(carrier, KEY_HEX, { dcs: [1, 2, 3, 4, 5] });
+    expect(result.error).toBeUndefined();
+    expect(result.success).toBe(true);
+    expect(result.dcs.every((dc) => dc.via === carrier)).toBe(true);
+    expect(seen.map((s) => s.dc).sort()).toEqual([1, 2, 3, 4, 5]);
+    expect(seen.every((s) => s.mode === 'intermediate')).toBe(true);
+    expect(stats).toEqual({ sessions: 1, deleted: 1, streams: 5 });
+  });
+
+  test('dd secret uses the padded transport', async () => {
+    seen.length = 0;
+    const { result } = await run('https', `dd${KEY_HEX}`);
+    expect(result.success).toBe(true);
+    expect(seen).toEqual([{ dc: 2, mode: 'padded', clientHelloLength: undefined }]);
+  });
+
+  test('base path deployment with a marked secret', async () => {
+    const marked = Buffer.concat([Buffer.from([0x70]), KEY]).toString('base64url');
+    const { result } = await run('websocket', KEY_HEX, {
+      basePath: 'secret/path-1',
+      link: `tg://webproxy?server=${HOST}%2Fsecret%2Fpath-1&secret=${marked}`,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.success).toBe(true);
+  });
+
+  test('wrong secret gets the public website, reported clearly', async () => {
+    const { result, stats } = await run('https', KEY_HEX, { link: `tg://webproxy?server=${HOST}&secret=${'ff'.repeat(16)}` });
     expect(result.success).toBe(false);
-    expect(result.error).toContain('not supported');
+    expect(result.error).toContain('HTTP 404');
+    expect(stats.sessions).toBe(0);
+  });
+
+  test('relay closing the stream is reported', async () => {
+    const { result } = await run('https', KEY_HEX, { rejectStreams: true });
+    expect(result.error).toContain('Relay closed the stream');
+  });
+
+  test('untrusted certificate fails like the official WebView would', async () => {
+    const { result } = await run('https', KEY_HEX, { trustCa: false });
+    expect(result.error).toContain('TLS certificate error');
   });
 });
 
